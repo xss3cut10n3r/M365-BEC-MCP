@@ -2,7 +2,7 @@
 
 This is the MCP server for **[M365 Email Log Analyzer](https://github.com/xss3cut10n3r/M365-BEC)**, the desktop app for investigating Microsoft 365 email compromise.
 
-Point Claude, or any MCP client, at your Purview audit, Entra sign-in, Entra directory audit, and Exchange message trace exports and let it search the timeline, mark what is malicious, and export the findings.
+Point any MCP client at your Purview audit, Entra sign-in, Entra directory audit, and Exchange message trace exports and let it search the timeline, mark what is malicious, and export the findings.
 
 It reads and writes the same `.bec` case files as the desktop app. Your original files are never changed.
 
