@@ -6,6 +6,8 @@
 typedef struct {
     sqlite3 *db;
     const char *export_dir;
+    gboolean full_output;
+    gboolean allow_marks;
 } Session;
 
 typedef yyjson_mut_doc JsonDoc;

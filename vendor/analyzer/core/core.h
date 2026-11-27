@@ -62,6 +62,7 @@ char *j_text(const JV *value, gboolean json_booleans);
 char *j_scalar(const JV *value);
 // Decode embedded JSON cells.
 const JV *j_decode(JDoc *doc, const JV *value);
+gboolean j_row_strings(const char *raw, const int *indexes, guint count, guint width, gboolean strict, GPtrArray *out);
 
 /* fields.c */
 typedef struct {
@@ -96,6 +97,7 @@ char *escape_pointer(const char *key);
 void register_functions(sqlite3 *db);
 char *source_label(const char *kind);
 char *field_display(Columns *columns, const char *raw, const char *pointer);
+char *field_json(Columns *columns, const char *raw, const char *pointer);
 
 /* bql.c */
 extern const char SQL_SOURCE[];
@@ -118,6 +120,7 @@ void args_int(GPtrArray *args, gint64 number);
 GPtrArray *args_new(void);
 int args_bind(sqlite3_stmt *statement, GPtrArray *args, int start);
 extern const char *const BQL_FIELDS[];
+char *bql_field_list(void);
 
 /* store.c */
 extern const char *const VERDICTS[4];
@@ -127,6 +130,7 @@ gboolean sql_run(sqlite3 *db, const char *sql, GError **error);
 gint64 sql_int(sqlite3 *db, const char *sql, GError **error);
 sqlite3_stmt *sql_prepare(sqlite3 *db, const char *sql, GError **error);
 gboolean assign_verdict(sqlite3 *db, const char *kind, GPtrArray *pairs, const char *verdict, GError **error);
+gint64 mark_matches(sqlite3 *db, gint64 log, const char *query, const char *verdict, gint64 limit, GError **error);
 gboolean undo_verdict(sqlite3 *db, GError **error);
 typedef struct {
     char *label;

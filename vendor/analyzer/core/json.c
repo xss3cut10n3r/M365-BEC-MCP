@@ -183,6 +183,31 @@ const JV *j_decode(JDoc *doc, const JV *value) {
     return decoded ? decoded : value;
 }
 
+// Reads string cells without trees.
+gboolean j_row_strings(const char *raw, const int *indexes, guint count, guint width, gboolean strict, GPtrArray *out) {
+    yyjson_doc *source = yyjson_read_opts((char *)raw, strlen(raw), YYJSON_READ_NUMBER_AS_RAW | YYJSON_READ_ALLOW_INF_AND_NAN,
+                                          NULL, NULL);
+    yyjson_val *row = yyjson_doc_get_root(source);
+    size_t size = yyjson_arr_size(row);
+    // Sparse rows need trees.
+    gboolean plain = yyjson_is_arr(row) && !(size == (size_t)width + 1 && yyjson_is_arr(yyjson_arr_get(row, width)));
+    for (guint i = 0; plain && i < count; i++) {
+        yyjson_val *cell = (size_t)indexes[i] < size ? yyjson_arr_get(row, (size_t)indexes[i]) : NULL;
+        if (yyjson_is_str(cell)) {
+            if (yyjson_get_len(cell) == strlen(yyjson_get_str(cell)))
+                g_ptr_array_add(out, g_strdup(yyjson_get_str(cell)));
+            else
+                plain = FALSE;
+        } else if (cell && (strict ? !yyjson_is_ctn(cell) : yyjson_is_ctn(cell))) {
+            plain = FALSE;
+        }
+    }
+    yyjson_doc_free(source);
+    if (!plain)
+        g_ptr_array_set_size(out, 0);
+    return plain;
+}
+
 void j_quote(GString *out, const char *text, gssize length) {
     if (length < 0)
         length = (gssize)strlen(text);
@@ -237,7 +262,7 @@ static gboolean integer_literal(const char *s) {
     return *s == 0;
 }
 
-// Matches Python float repr.
+// Shortest round-trip float text.
 char *py_float_repr(double value) {
     if (isnan(value))
         return g_strdup("NaN");

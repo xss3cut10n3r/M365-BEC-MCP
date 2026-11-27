@@ -39,6 +39,10 @@ char *sql_reason(void) {
 const char *const BQL_FIELDS[] = {"source", "file",      "sheet",  "path",    "sha256", "issue", "markreason",
                                   "verdict", "time",     "operation", "result", "request", "actor", "raw", NULL};
 
+static int name_order(gconstpointer a, gconstpointer b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
 static const char *field_sql(const char *field) {
     static const char *const sql[] = {
         SQL_SOURCE, "l.name", "l.sheet", "(SELECT path FROM files WHERE id=l.file)",
@@ -48,6 +52,23 @@ static const char *field_sql(const char *field) {
         if (!strcmp(BQL_FIELDS[i], field))
             return sql[i];
     return NULL;
+}
+
+// Lists every filter field.
+char *bql_field_list(void) {
+    GPtrArray *names = g_ptr_array_new();
+    for (int i = 0; BQL_FIELDS[i]; i++)
+        g_ptr_array_add(names, (gpointer)BQL_FIELDS[i]);
+    for (int i = 0; i < SLOT_COUNT; i++)
+        g_ptr_array_add(names, (gpointer)SLOTS[i].name);
+    static const char *const extra[] = {"id", "row", "ip", "mailbox", "marked"};
+    for (guint i = 0; i < G_N_ELEMENTS(extra); i++)
+        g_ptr_array_add(names, (gpointer)extra[i]);
+    g_ptr_array_sort(names, name_order);
+    g_ptr_array_add(names, NULL);
+    char *list = g_strjoinv(", ", (char **)names->pdata);
+    g_ptr_array_free(names, TRUE);
+    return list;
 }
 
 static void arg_free(gpointer data) {
@@ -167,8 +188,14 @@ static char *unquote(Parser *parser, const char *literal) {
 static char *expression(Parser *parser);
 
 static char *comparison(const char *expr, const char *op) {
+    // Timestamps compare as stored.
+    if (!strcmp(expr, "e.time"))
+        return g_strdup_printf(op[0] == '<' ? "(e.time!='' AND e.time %s ?)" : "e.time %s ?", op);
+    // Whole records stay unfolded.
     if (!strcmp(op, "contains"))
-        return g_strdup_printf("instr(lower(%s),lower(?))>0", expr);
+        return g_strdup_printf(strcmp(expr, "e.raw") ? "instr(bql_fold(%s),bql_fold(?))>0" : "instr(lower(%s),lower(?))>0", expr);
+    if (!strcmp(op, "=") || !strcmp(op, "==") || !strcmp(op, "!="))
+        return g_strdup_printf("bql_fold(%s) %s bql_fold(?)", expr, op);
     return g_strdup_printf("%s %s ? COLLATE NOCASE", expr, op);
 }
 
@@ -318,7 +345,9 @@ static char *term(Parser *parser) {
     }
     const char *column = field_sql(field);
     if (!column) {
-        bec_fail(parser->error, "Unknown field: %s", field);
+        char *known = bql_field_list();
+        bec_fail(parser->error, "Unknown field: %s. Fields: %s. Nested: field \"/Header/key\" = \"value\".", field, known);
+        g_free(known);
         goto done;
     }
     if (!strcmp(field, "source")) {

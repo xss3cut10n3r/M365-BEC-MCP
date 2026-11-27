@@ -22,7 +22,7 @@ CMake uses the system yyjson library when available. Otherwise it fetches a pinn
 ## Compile and test
 
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel
 cmake --build build
 ctest --test-dir build --output-on-failure
 cmake --install build --prefix dist/local

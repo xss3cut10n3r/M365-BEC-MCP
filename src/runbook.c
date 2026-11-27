@@ -101,21 +101,58 @@ static const struct { const char *name, *filter; } activity[] = {
     {"consent_or_app_changes", "operation contains \"consent\" OR operation contains \"service principal\" OR operation contains \"app role\" OR operation contains \"permission grant\" OR operation contains \"application\""}
 };
 
-static void review_period(JsonDoc *doc, Json *result, Session *session, const char *name,
-                          const char *identity, const char *start, const char *end, GError **error) {
+#define CATEGORY_COUNT G_N_ELEMENTS(activity)
+
+static char *window_filter(const char *identity, const char *start, const char *end) {
+    return g_strdup_printf("mailbox = %s AND time >= \"%s\" AND time < \"%s\"", identity, start, end);
+}
+
+static void count_activity(sqlite3 *db, const char *scope, const char *cut,
+                           gint64 counts[2][CATEGORY_COUNT], GError **error) {
+    GPtrArray *args = args_new();
+    args_text(args, cut);
+    GString *sql = g_string_new("SELECT e.time>=?, count(*)");
+    for (size_t i = 1; i < CATEGORY_COUNT && !*error; i++) {
+        char *predicate = where_sql(0, activity[i].filter, args, error);
+        if (predicate) g_string_append_printf(sql, ", count(*) FILTER (%s)", predicate);
+        g_free(predicate);
+    }
+    char *clause = *error ? NULL : where_sql(0, scope, args, error);
+    if (clause) {
+        g_string_append(sql, " FROM events e JOIN logs l ON e.log=l.id");
+        g_string_append(sql, clause);
+        g_string_append(sql, " GROUP BY 1");
+        sqlite3_stmt *st = sql_prepare(db, sql->str, error);
+        if (st) {
+            args_bind(st, args, 1);
+            int state;
+            while ((state = sqlite3_step(st)) == SQLITE_ROW) {
+                int period = sqlite3_column_int(st, 0);
+                for (size_t i = 0; i < CATEGORY_COUNT; i++)
+                    counts[period][i] = sqlite3_column_int64(st, (int)i + 1);
+            }
+            if (state != SQLITE_DONE) bec_fail(error, "%s", sqlite3_errmsg(db));
+            sqlite3_finalize(st);
+        }
+    }
+    g_free(clause);
+    g_string_free(sql, TRUE);
+    g_ptr_array_free(args, TRUE);
+}
+
+static void full_period(JsonDoc *doc, Json *result, const char *name, const char *scope,
+                        const char *start, const char *end, const gint64 *counts) {
     Json *window = yyjson_mut_obj_add_obj(doc, result, name);
     put_text(doc, window, "start_inclusive_utc", start);
     put_text(doc, window, "end_exclusive_utc", end);
-    char *scope = g_strdup_printf("mailbox = %s AND time >= \"%s\" AND time < \"%s\"", identity, start, end);
     Json *observations = yyjson_mut_obj_add_obj(doc, window, "observations");
-    for (guint i = 0; i < G_N_ELEMENTS(activity) && !*error; i++) {
+    for (size_t i = 0; i < CATEGORY_COUNT; i++) {
         char *bql = combine_filters(scope, activity[i].filter);
         Json *entry = yyjson_mut_obj_add_obj(doc, observations, activity[i].name);
         put_text(doc, entry, "bql", bql);
-        yyjson_mut_obj_add_int(doc, entry, "count", count_rows(session->db, 0, bql, error));
+        yyjson_mut_obj_add_int(doc, entry, "count", counts[i]);
         g_free(bql);
     }
-    g_free(scope);
 }
 
 Json *compare_containment(JsonDoc *doc, Session *session, Input *args, GError **error) {
@@ -131,8 +168,30 @@ Json *compare_containment(JsonDoc *doc, Session *session, Input *args, GError **
         put_text(doc, result, "mailbox", mailbox);
         put_text(doc, result, "scope", "Matched mailbox identities and dated events only. Categories overlap. "
                  "Review other sign-in results and tenant-wide grants separately. Counts measure recorded activity.");
-        review_period(doc, result, session, "before", identity, start, cut, error);
-        if (!*error) review_period(doc, result, session, "after", identity, cut, end, error);
+        char *scope = window_filter(identity, start, end);
+        char *before = window_filter(identity, start, cut);
+        char *after = window_filter(identity, cut, end);
+        gint64 counts[2][CATEGORY_COUNT] = {{0}};
+        count_activity(session->db, scope, cut, counts, error);
+        if (!*error && session->full_output) {
+            full_period(doc, result, "before", before, start, cut, counts[0]);
+            full_period(doc, result, "after", after, cut, end, counts[1]);
+        } else if (!*error) {
+            put_text(doc, result, "before_bql", before);
+            put_text(doc, result, "after_bql", after);
+            Json *pairs = yyjson_mut_obj_add_obj(doc, result, "counts_before_after");
+            Json *filters = yyjson_mut_obj_add_obj(doc, result, "category_bql");
+            for (size_t i = 0; i < CATEGORY_COUNT; i++) {
+                Json *pair = yyjson_mut_obj_add_arr(doc, pairs, activity[i].name);
+                yyjson_mut_arr_add_int(doc, pair, counts[0][i]);
+                yyjson_mut_arr_add_int(doc, pair, counts[1][i]);
+                if (i && (counts[0][i] || counts[1][i]))
+                    put_text(doc, filters, activity[i].name, activity[i].filter);
+            }
+        }
+        g_free(after);
+        g_free(before);
+        g_free(scope);
         g_free(identity);
     }
     g_free(start);

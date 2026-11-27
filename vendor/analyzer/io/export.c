@@ -150,30 +150,56 @@ static gboolean write_xlsx(Cursor *cursor, sqlite3 *db, const char *path, GPtrAr
     lxw_worksheet *sheet = workbook_add_worksheet(book, "Timeline");
     // Blank cells keep row widths.
     lxw_format *plain = workbook_add_format(book);
+    lxw_format *bold = workbook_add_format(book);
+    format_set_bold(bold);
+    // Excel good, bad, neutral.
+    static const struct {
+        const char *verdict;
+        lxw_color_t fill, text;
+    } tints[] = {{"Good", 0xC6EFCE, 0x006100}, {"Bad", 0xFFC7CE, 0x9C0006}, {"Unsure", 0xFFEB9C, 0x9C5700}};
+    lxw_format *fills[G_N_ELEMENTS(tints)];
+    for (guint i = 0; i < G_N_ELEMENTS(tints); i++) {
+        fills[i] = workbook_add_format(book);
+        format_set_bg_color(fills[i], tints[i].fill);
+        format_set_font_color(fills[i], tints[i].text);
+    }
+    static const double widths[] = {24, 30, 10, 11, 27, 34, 34, 14, 22, 16, 14, 9, 10};
     GError *problem = NULL;
     lxw_row_t line = 0;
     gint64 index = 0;
-    for (guint i = 0; i < titles->len; i++)
-        worksheet_write_string(sheet, 0, (lxw_col_t)i, titles->pdata[i], NULL);
-    while (!problem && next_row(cursor, db, &problem)) {
-        index++;
-        if (index > 1 && (index - 1) % 1048575 == 0) {
-            sheet = workbook_add_worksheet(book, NULL);
-            for (guint i = 0; i < titles->len; i++)
-                worksheet_write_string(sheet, 0, (lxw_col_t)i, titles->pdata[i], NULL);
+    gboolean fresh = TRUE;
+    while (!problem && (fresh || next_row(cursor, db, &problem))) {
+        if (!fresh)
+            index++;
+        if (fresh || (index > 1 && (index - 1) % 1048575 == 0)) {
+            if (!fresh)
+                sheet = workbook_add_worksheet(book, NULL);
+            for (guint i = 0; i < titles->len; i++) {
+                worksheet_set_column(sheet, (lxw_col_t)i, (lxw_col_t)i, i < G_N_ELEMENTS(widths) ? widths[i] : 28, NULL);
+                worksheet_write_string(sheet, 0, (lxw_col_t)i, titles->pdata[i], bold);
+            }
+            worksheet_freeze_panes(sheet, 1, 0);
             line = 0;
+            if (fresh) {
+                fresh = FALSE;
+                continue;
+            }
         }
         line++;
+        lxw_format *tint = NULL;
+        for (guint i = 0; i < G_N_ELEMENTS(tints); i++)
+            if (!strcmp(cursor->cells->pdata[12], tints[i].verdict))
+                tint = fills[i];
         for (guint i = 0; i < cursor->cells->len && !problem; i++) {
             const char *cell = cursor->cells->pdata[i];
             if (i == 3 || i == 11) {
-                worksheet_write_number(sheet, line, (lxw_col_t)i, (double)g_ascii_strtoll(cell, NULL, 10), NULL);
+                worksheet_write_number(sheet, line, (lxw_col_t)i, (double)g_ascii_strtoll(cell, NULL, 10), tint);
             } else if (g_utf8_strlen(cell, -1) > 32767) {
                 bec_fail(&problem, "Value exceeds Excel cell limit. Export CSV instead.");
             } else if (*cell) {
-                worksheet_write_string(sheet, line, (lxw_col_t)i, cell, NULL);
+                worksheet_write_string(sheet, line, (lxw_col_t)i, cell, tint);
             } else {
-                worksheet_write_blank(sheet, line, (lxw_col_t)i, plain);
+                worksheet_write_blank(sheet, line, (lxw_col_t)i, tint ? tint : plain);
             }
         }
     }

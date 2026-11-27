@@ -281,11 +281,11 @@ GPtrArray *stats_calculate(sqlite3 *db, const char *key, gint64 log, const char 
         } else if (!strcmp(field, "source")) {
             expr = g_strdup(SQL_SOURCE);
         } else if (!strcmp(field, "operation")) {
-            expr = g_strdup("e.op");
+            expr = g_strdup("trim(e.op)");
         } else if (!strcmp(field, "actor")) {
-            expr = g_strdup("e.actor");
+            expr = g_strdup("trim(e.actor)");
         } else if (!strcmp(field, "result")) {
-            expr = g_strdup("e.result");
+            expr = g_strdup("trim(e.result)");
         } else if (!strcmp(field, "file")) {
             expr = g_strdup("l.name");
         } else if (!strcmp(field, "verdict")) {
@@ -300,7 +300,7 @@ GPtrArray *stats_calculate(sqlite3 *db, const char *key, gint64 log, const char 
             // Find logs containing this field.
             GString *branches = g_string_new(NULL);
             GString *marks = g_string_new(NULL);
-            sqlite3_stmt *logs = sql_prepare(db, "SELECT id,headers FROM logs", error);
+            sqlite3_stmt *logs = sql_prepare(db, "SELECT id,headers,name FROM logs", error);
             if (!logs) {
                 g_string_free(branches, TRUE);
                 g_string_free(marks, TRUE);
@@ -322,13 +322,15 @@ GPtrArray *stats_calculate(sqlite3 *db, const char *key, gint64 log, const char 
                         for (guint k = 0; found && k < found->len; k++, hits++)
                             position = g_array_index(found, int, k);
                     }
-                    gboolean nested = columns_support(columns, "rule");
+                    // JSON cells may hold objects.
+                    gboolean nested = columns_support(columns, "rule") || log_is_json(column_text(logs, 2));
                     if (!nested && hits == 1 && strcmp(field, "recipient") && strcmp(field, "target") &&
                         strcmp(field, "delivery"))
                         g_string_append_printf(branches,
                                                "WHEN %" G_GINT64_FORMAT
-                                               " THEN json_array(trim(json_extract(e.raw,'$[%d]'))) ",
-                                               id, position);
+                                               " THEN CASE WHEN json_type(e.raw,'$[%d]')='text' THEN "
+                                               "json_array(trim(json_extract(e.raw,'$[%d]'))) ELSE json_array() END ",
+                                               id, position, position);
                 }
                 columns_free(columns);
             }
@@ -354,7 +356,7 @@ GPtrArray *stats_calculate(sqlite3 *db, const char *key, gint64 log, const char 
             if (simple)
                 g_string_append_printf(clause, " AND %s IS NOT NULL AND %s!=''", expr, expr);
             g_string_append_printf(group, "%s%s COLLATE %s", index ? "," : "", expr,
-                                   slot_find(field) ? "BQL_TEXT" : "NOCASE");
+                                   strcmp(field, "time") && strcmp(field, "ip") ? "BQL_TEXT" : "NOCASE");
         }
         g_free(expr);
     }

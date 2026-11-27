@@ -217,6 +217,49 @@ gboolean assign_verdict(sqlite3 *db, const char *kind, GPtrArray *pairs, const c
     return sql_run(db, "COMMIT", error);
 }
 
+// Marks every matching event.
+gint64 mark_matches(sqlite3 *db, gint64 log, const char *query, const char *verdict, gint64 limit, GError **error) {
+    if (!g_strv_contains((const char *const[]){"Good", "Bad", "Unsure", "Unmarked", NULL}, verdict)) {
+        bec_fail(error, "Unknown verdict or scope");
+        return -1;
+    }
+    gint64 count = count_rows(db, log, query, error);
+    if (count < 0)
+        return -1;
+    if (limit > 0 && count > limit) {
+        bec_fail(error, "%" G_GINT64_FORMAT " events match. Narrow the filter or mark an IP or time range.", count);
+        return -1;
+    }
+    if (!count || !sql_run(db, "BEGIN IMMEDIATE", error))
+        return count ? -1 : 0;
+    GError *problem = NULL;
+    GPtrArray *args = args_new();
+    args_text(args, verdict);
+    char *clause = where_sql(log, query, args, &problem);
+    if (clause) {
+        char *sql = g_strconcat("INSERT INTO verdict_rules(batch,kind,lo,hi,verdict) SELECT (SELECT coalesce(max(batch),0)+1 "
+                                "FROM verdict_rules),'event',CAST(e.id AS TEXT),'',?",
+                                EVENT_JOIN, clause, NULL);
+        sqlite3_stmt *insert = sql_prepare(db, sql, &problem);
+        if (insert) {
+            args_bind(insert, args, 1);
+            if (sqlite3_step(insert) != SQLITE_DONE)
+                bec_fail(&problem, "%s", sqlite3_errmsg(db));
+            count = sqlite3_changes64(db);
+            sqlite3_finalize(insert);
+        }
+        g_free(sql);
+    }
+    g_free(clause);
+    g_ptr_array_free(args, TRUE);
+    if (problem) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        g_propagate_error(error, problem);
+        return -1;
+    }
+    return sql_run(db, "COMMIT", error) ? count : -1;
+}
+
 gboolean undo_verdict(sqlite3 *db, GError **error) {
     if (!sql_run(db, "BEGIN IMMEDIATE", error))
         return FALSE;
@@ -238,9 +281,12 @@ char *select_sql(GPtrArray *custom, GPtrArray *args) {
     g_free(verdict);
     g_free(reason);
     for (guint i = 0; custom && i < custom->len; i++) {
-        g_string_append_printf(sql, ",field_display(l.headers,e.raw,?) AS custom_%u", i);
-        args_text(args, ((CustomColumn *)custom->pdata[i])->path);
+        // Paths start with slashes.
+        const char *path = ((CustomColumn *)custom->pdata[i])->path;
+        g_string_append_printf(sql, ",%s(l.headers,e.raw,?) AS custom_%u", *path == '/' ? "field_display" : "slot_display", i);
+        args_text(args, path);
     }
+    g_string_append(sql, ",e.log AS log_id");
     g_string_append(sql, EVENT_JOIN);
     return g_string_free(sql, FALSE);
 }

@@ -7,13 +7,13 @@ const Slot SLOTS[] = {
     {"device", {"Device ID"}, {"DeviceId"}},
     {"session", {"Session ID"}, {"SessionId", "AADSessionId"}},
     {"correlation", {"Correlation ID", "CorrelationId"}, {"CorrelationId"}},
-    {"application", {"Application"}, {"ApplicationDisplayName"}},
-    {"appid", {"Application ID"}, {"AppId", "ClientAppId"}},
+    {"application", {"Application", "appDisplayName"}, {"ApplicationDisplayName"}},
+    {"appid", {"Application ID", "appId"}, {"AppId", "ClientAppId"}},
     {"location", {"Location"}, {NULL}},
     {"os", {"Operating System"}, {NULL}},
-    {"client", {"Client app"}, {"ClientInfoString"}},
+    {"client", {"Client app", "clientAppUsed"}, {"ClientInfoString"}},
     {"authmethod", {"Authentication method"}, {NULL}},
-    {"conditionalaccess", {"Conditional Access"}, {NULL}},
+    {"conditionalaccess", {"Conditional Access", "conditionalAccessStatus"}, {NULL}},
     {"serviceprincipal", {"Service principal ID", "ActorServicePrincipalId"}, {NULL}},
     {"workload", {"Service"}, {"Workload"}},
     {"messageid", {"message_id", "MessageId", "Message ID"}, {NULL}},
@@ -99,6 +99,9 @@ gboolean columns_support(const Columns *columns, const char *field) {
     for (int i = 0; slot && i < 5 && slot->outer[i]; i++)
         if (columns_get(columns, slot->outer[i]))
             return TRUE;
+    // Graph nests device details.
+    if ((!strcmp(field, "device") || !strcmp(field, "os")) && has(columns, "devicedetail"))
+        return TRUE;
     if (!strcmp(field, "target"))
         for (guint i = 0; i < columns->clean->len; i++)
             if (g_str_has_prefix(columns->clean->pdata[i], "target"))
@@ -289,6 +292,27 @@ GPtrArray *event_values(EventFields *fields, const char *field) {
     } else {
         for (guint i = 0; i < cells->len; i++)
             add_text(texts, cells->pdata[i]);
+        if (!strcmp(field, "location")) {
+            // Graph locations are objects.
+            for (guint i = 0; i < cells->len; i++) {
+                const JV *place = cells->pdata[i];
+                GString *joined = g_string_new(NULL);
+                static const char *const parts[] = {"city", "state", "countryOrRegion"};
+                for (guint k = 0; place->t == J_OBJ && k < G_N_ELEMENTS(parts); k++) {
+                    const JV *part = j_get(place, parts[k]);
+                    if (part && part->t == J_STR && *part->u.s)
+                        g_string_append_printf(joined, "%s%s", joined->len ? ", " : "", part->u.s);
+                }
+                if (joined->len)
+                    g_ptr_array_add(texts, g_strdup(joined->str));
+                g_string_free(joined, TRUE);
+            }
+        } else if (!strcmp(field, "device") || !strcmp(field, "os")) {
+            g_ptr_array_set_size(cells, 0);
+            outer(fields, "deviceDetail", cells);
+            for (guint i = 0; i < cells->len; i++)
+                add_text(texts, j_get(cells->pdata[i], field[0] == 'd' ? "deviceId" : "operatingSystem"));
+        }
         if (!strcmp(field, "session")) {
             add_text(texts, j_get(j_get(record, "AppAccessContext"), "AADSessionId"));
         } else if (!strcmp(field, "subject")) {
@@ -401,6 +425,7 @@ typedef struct {
     gboolean presence;
     gboolean done;
     GPtrArray *out;
+    gboolean json;
 } Walk;
 
 static void walk(Walk *state, const JV *actual, guint depth) {
@@ -410,6 +435,10 @@ static void walk(Walk *state, const JV *actual, guint depth) {
         if (state->presence) {
             g_ptr_array_add(state->out, g_strdup(""));
             state->done = TRUE;
+        } else if (state->json) {
+            GString *text = g_string_new(NULL);
+            j_dump(text, j_decode(state->doc, actual), J_RAW_NUMBERS);
+            g_ptr_array_add(state->out, g_string_free(text, FALSE));
         } else if (!j_is_container(actual)) {
             g_ptr_array_add(state->out, j_scalar(actual));
         }
@@ -436,12 +465,42 @@ static void walk(Walk *state, const JV *actual, guint depth) {
     }
 }
 
+typedef JDoc *(*RowSource)(gpointer user);
+static GPtrArray *pointer_walk(Columns *columns, const char *raw, const char *pointer, gboolean presence, gboolean json,
+                               RowSource source, gpointer user);
+
 GPtrArray *pointer_values(Columns *columns, const char *raw, const char *pointer, gboolean presence) {
+    return pointer_walk(columns, raw, pointer, presence, FALSE, NULL, NULL);
+}
+
+// Returns matched nodes as JSON.
+char *field_json(Columns *columns, const char *raw, const char *pointer) {
+    GPtrArray *found = pointer_walk(columns, raw, pointer, FALSE, TRUE, NULL, NULL);
+    char *out = NULL;
+    if (found->len == 1) {
+        out = g_strdup(found->pdata[0]);
+    } else if (found->len > 1) {
+        GString *list = g_string_new("[");
+        for (guint i = 0; i < found->len; i++)
+            g_string_append_printf(list, "%s%s", i ? "," : "", (char *)found->pdata[i]);
+        out = g_string_free(g_string_append_c(list, ']'), FALSE);
+    }
+    g_ptr_array_free(found, TRUE);
+    return out;
+}
+
+static GPtrArray *pointer_walk(Columns *columns, const char *raw, const char *pointer, gboolean presence, gboolean json,
+                               RowSource source, gpointer user) {
     GPtrArray *out = g_ptr_array_new_with_free_func(g_free);
     if (!pointer || pointer[0] != '/')
         return out;
     char **split = g_strsplit(pointer + 1, "/", -1);
     guint total = g_strv_length(split);
+    // A lone slash names nothing.
+    if (!total) {
+        g_strfreev(split);
+        return out;
+    }
     for (guint i = 0; i < total; i++) {
         char *part = unescape_part(split[i]);
         g_free(split[i]);
@@ -461,9 +520,10 @@ GPtrArray *pointer_values(Columns *columns, const char *raw, const char *pointer
     char *clean = clean_header(head);
     GArray *positions = g_hash_table_lookup(columns->positions, clean);
     g_free(clean);
-    JDoc *doc = positions ? j_parse(raw, -1, 0, NULL) : NULL;
+    // Borrowed rows stay cached.
+    JDoc *doc = !positions ? NULL : source ? source(user) : j_parse(raw, -1, 0, NULL);
     if (doc && doc->root->t == J_ARR) {
-        Walk state = {doc, split + 1, total - 1, presence, FALSE, out};
+        Walk state = {doc, split + 1, total - 1, presence, FALSE, out, json};
         for (guint i = 0; i < positions->len; i++) {
             if (ordinal >= 0 && (int)i != ordinal)
                 continue;
@@ -472,7 +532,8 @@ GPtrArray *pointer_values(Columns *columns, const char *raw, const char *pointer
                 walk(&state, doc->root->u.a[index], 0);
         }
     }
-    j_free(doc);
+    if (!source)
+        j_free(doc);
     g_strfreev(split);
     return out;
 }
@@ -499,16 +560,87 @@ char *source_label(const char *kind) {
 
 /* SQL functions share column caches. */
 
+typedef struct {
+    int refs;
+    GHashTable *columns;
+    // Last looked-up headers.
+    char *headers;
+    Columns *layout;
+    // Last parsed row.
+    char *raw;
+    EventFields *fields;
+} Shared;
+
+static void forget_row(Shared *shared) {
+    event_fields_free(shared->fields);
+    g_free(shared->raw);
+    shared->fields = NULL;
+    shared->raw = NULL;
+}
+
 static Columns *cached_columns(sqlite3_context *context, const char *headers) {
-    GHashTable *cache = sqlite3_user_data(context);
+    Shared *shared = sqlite3_user_data(context);
+    if (shared->headers && !strcmp(shared->headers, headers))
+        return shared->layout;
+    GHashTable *cache = shared->columns;
     Columns *columns = g_hash_table_lookup(cache, headers);
     if (!columns) {
-        if (g_hash_table_size(cache) > 256)
+        if (g_hash_table_size(cache) > 256) {
+            forget_row(shared);
             g_hash_table_remove_all(cache);
+        }
         columns = columns_new(headers);
         g_hash_table_insert(cache, g_strdup(headers), columns);
     }
+    g_free(shared->headers);
+    shared->headers = g_strdup(headers);
+    shared->layout = columns;
     return columns;
+}
+
+// Folds case and outer spaces.
+static char *fold_trimmed(const char *text) {
+    char *stripped = py_strip(text);
+    char *folded = casefold(stripped);
+    g_free(stripped);
+    return folded;
+}
+
+static gboolean folded_hit(GPtrArray *found, const char *value, gboolean contains) {
+    char *needle = contains ? casefold(value) : fold_trimmed(value);
+    gboolean hit = FALSE;
+    for (guint i = 0; i < found->len && !hit; i++) {
+        if (contains) {
+            hit = contains_folded(found->pdata[i], needle);
+        } else {
+            char *folded = fold_trimmed(found->pdata[i]);
+            hit = !strcmp(folded, needle);
+            g_free(folded);
+        }
+    }
+    g_free(needle);
+    return hit;
+}
+
+
+
+// Plain logs skip tree parsing.
+static gboolean plain_slot_values(Columns *columns, const char *field, const char *raw, GPtrArray *out) {
+    if (has(columns, "auditdata") || flat_audit(columns) || !strcmp(field, "recipient") || !strcmp(field, "delivery") ||
+        !strcmp(field, "target") || has(columns, "devicedetail"))
+        return FALSE;
+    const Slot *slot = slot_find(field);
+    int indexes[32];
+    guint count = 0;
+    for (int i = 0; slot && i < 5 && slot->outer[i]; i++) {
+        GArray *positions = columns_get(columns, slot->outer[i]);
+        for (guint k = 0; positions && k < positions->len; k++) {
+            if (count == G_N_ELEMENTS(indexes))
+                return FALSE;
+            indexes[count++] = g_array_index(positions, int, k);
+        }
+    }
+    return slot && j_row_strings(raw, indexes, count, columns->names->len, FALSE, out);
 }
 
 static const char *arg(sqlite3_value **values, int index) {
@@ -516,16 +648,40 @@ static const char *arg(sqlite3_value **values, int index) {
     return text ? text : "";
 }
 
+static void fn_fold(sqlite3_context *context, int count, sqlite3_value **values) {
+    (void)count;
+    sqlite3_result_text(context, fold_trimmed(arg(values, 0)), -1, g_free);
+}
+
 static void fn_source_label(sqlite3_context *context, int count, sqlite3_value **values) {
     (void)count;
     sqlite3_result_text(context, source_label(arg(values, 0)), -1, g_free);
 }
 
+// Filter terms reuse one parse.
 static EventFields *borrowed_fields(sqlite3_context *context, sqlite3_value **values) {
+    Shared *shared = sqlite3_user_data(context);
+    Columns *columns = cached_columns(context, arg(values, 0));
+    const char *raw = arg(values, 1);
+    if (shared->fields && shared->fields->columns == columns && !strcmp(shared->raw, raw))
+        return shared->fields;
+    forget_row(shared);
     EventFields *fields = g_new0(EventFields, 1);
-    fields->columns = cached_columns(context, arg(values, 0));
-    fields->row = j_parse(arg(values, 1), -1, 0, NULL);
+    fields->columns = columns;
+    fields->row = j_parse(raw, -1, 0, NULL);
+    shared->fields = fields;
+    shared->raw = g_strdup(raw);
     return fields;
+}
+
+typedef struct {
+    sqlite3_context *context;
+    sqlite3_value **values;
+} Borrow;
+
+static JDoc *borrowed_row(gpointer user) {
+    Borrow *borrow = user;
+    return borrowed_fields(borrow->context, borrow->values)->row;
 }
 
 static void fn_event_values(sqlite3_context *context, int count, sqlite3_value **values) {
@@ -536,11 +692,30 @@ static void fn_event_values(sqlite3_context *context, int count, sqlite3_value *
     for (guint i = 0; i < found->len; i++) {
         if (i)
             g_string_append_c(out, ',');
-        j_quote(out, found->pdata[i], -1);
+        // Groups ignore outer spaces.
+        char *stripped = py_strip(found->pdata[i]);
+        j_quote(out, stripped, -1);
+        g_free(stripped);
     }
     g_string_append_c(out, ']');
     g_ptr_array_free(found, TRUE);
-    event_fields_free(fields);
+    sqlite3_result_text(context, g_string_free(out, FALSE), -1, g_free);
+}
+
+// Shows a named field.
+static void fn_slot_display(sqlite3_context *context, int count, sqlite3_value **values) {
+    (void)count;
+    EventFields *fields = borrowed_fields(context, values);
+    GPtrArray *found = event_values(fields, arg(values, 2));
+    GString *out = g_string_new(NULL);
+    for (guint i = 0; i < found->len; i++) {
+        gboolean repeat = FALSE;
+        for (guint k = 0; k < i && !repeat; k++)
+            repeat = !strcmp(found->pdata[k], found->pdata[i]);
+        if (!repeat)
+            g_string_append_printf(out, "%s%s", out->len ? " · " : "", (char *)found->pdata[i]);
+    }
+    g_ptr_array_free(found, TRUE);
     sqlite3_result_text(context, g_string_free(out, FALSE), -1, g_free);
 }
 
@@ -553,15 +728,13 @@ static void fn_event_match(sqlite3_context *context, int count, sqlite3_value **
         sqlite3_result_int(context, negate);
         return;
     }
-    EventFields *fields = borrowed_fields(context, values);
-    GPtrArray *found = event_values(fields, field);
-    char *needle = casefold(arg(values, 4));
-    gboolean contains = !strcmp(op, "contains"), hit = FALSE;
-    for (guint i = 0; i < found->len && !hit; i++)
-        hit = contains ? contains_folded(found->pdata[i], needle) : equals_folded(found->pdata[i], needle);
-    g_free(needle);
+    GPtrArray *found = g_ptr_array_new_with_free_func(g_free);
+    if (!plain_slot_values(columns, field, arg(values, 1), found)) {
+        g_ptr_array_free(found, TRUE);
+        found = event_values(borrowed_fields(context, values), field);
+    }
+    gboolean hit = folded_hit(found, arg(values, 4), !strcmp(op, "contains"));
     g_ptr_array_free(found, TRUE);
-    event_fields_free(fields);
     sqlite3_result_int(context, negate ? !hit : hit);
 }
 
@@ -570,16 +743,26 @@ static void fn_match_path(sqlite3_context *context, int count, sqlite3_value **v
     const char *op = arg(values, 3);
     Columns *columns = cached_columns(context, arg(values, 0));
     gboolean exists = !strcmp(op, "exists");
-    GPtrArray *found = pointer_values(columns, arg(values, 1), arg(values, 2), exists);
+    Borrow borrow = {context, values};
+    const char *pointer = arg(values, 2);
+    GPtrArray *found = NULL;
+    // Top-level text cells skip trees.
+    if (!exists && pointer[0] == '/' && pointer[1] != '@' && !strchr(pointer + 1, '/') && !strchr(pointer, '~')) {
+        char *clean = clean_header(pointer + 1);
+        GArray *positions = g_hash_table_lookup(columns->positions, clean);
+        g_free(clean);
+        found = g_ptr_array_new_with_free_func(g_free);
+        if (positions && (positions->len > 32 || !j_row_strings(arg(values, 1), (const int *)positions->data,
+                                                               positions->len, columns->names->len, TRUE, found)))
+            g_clear_pointer(&found, g_ptr_array_unref);
+    }
+    if (!found)
+        found = pointer_walk(columns, arg(values, 1), pointer, exists, FALSE, borrowed_row, &borrow);
     gboolean hit = FALSE;
     if (exists) {
         hit = found->len > 0;
     } else {
-        char *needle = casefold(arg(values, 4));
-        gboolean contains = !strcmp(op, "contains");
-        for (guint i = 0; i < found->len && !hit; i++)
-            hit = contains ? contains_folded(found->pdata[i], needle) : equals_folded(found->pdata[i], needle);
-        g_free(needle);
+        hit = folded_hit(found, arg(values, 4), !strcmp(op, "contains"));
         if (!strcmp(op, "!="))
             hit = !hit;
     }
@@ -587,8 +770,7 @@ static void fn_match_path(sqlite3_context *context, int count, sqlite3_value **v
     sqlite3_result_int(context, hit);
 }
 
-char *field_display(Columns *columns, const char *raw, const char *pointer) {
-    GPtrArray *found = pointer_values(columns, raw, pointer, FALSE);
+static char *joined_values(GPtrArray *found) {
     GString *out = g_string_new(NULL);
     for (guint i = 0; i < found->len; i++) {
         gboolean repeat = FALSE;
@@ -604,10 +786,16 @@ char *field_display(Columns *columns, const char *raw, const char *pointer) {
     return g_string_free(out, FALSE);
 }
 
+char *field_display(Columns *columns, const char *raw, const char *pointer) {
+    return joined_values(pointer_values(columns, raw, pointer, FALSE));
+}
+
 static void fn_field_display(sqlite3_context *context, int count, sqlite3_value **values) {
     (void)count;
     Columns *columns = cached_columns(context, arg(values, 0));
-    sqlite3_result_text(context, field_display(columns, arg(values, 1), arg(values, 2)), -1, g_free);
+    Borrow borrow = {context, values};
+    GPtrArray *found = pointer_walk(columns, arg(values, 1), arg(values, 2), FALSE, FALSE, borrowed_row, &borrow);
+    sqlite3_result_text(context, joined_values(found), -1, g_free);
 }
 
 static int collate_folded(void *unused, int left_size, const void *left, int right_size, const void *right) {
@@ -622,8 +810,14 @@ static int collate_folded(void *unused, int left_size, const void *left, int rig
     return order;
 }
 
-static void free_cache(void *cache) {
-    g_hash_table_destroy(cache);
+static void free_cache(void *data) {
+    Shared *shared = data;
+    if (--shared->refs)
+        return;
+    forget_row(shared);
+    g_free(shared->headers);
+    g_hash_table_destroy(shared->columns);
+    g_free(shared);
 }
 
 void register_functions(sqlite3 *db) {
@@ -634,13 +828,15 @@ void register_functions(sqlite3 *db) {
     } functions[] = {
         {"source_label", 1, fn_source_label}, {"event_values", 3, fn_event_values},
         {"event_match", 5, fn_event_match},   {"match_path", 5, fn_match_path},
-        {"field_display", 3, fn_field_display},
+        {"field_display", 3, fn_field_display}, {"slot_display", 3, fn_slot_display},
+        {"bql_fold", 1, fn_fold},
     };
-    for (guint i = 0; i < G_N_ELEMENTS(functions); i++) {
-        GHashTable *cache =
-            g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)columns_free);
+    // One cache per connection.
+    Shared *shared = g_new0(Shared, 1);
+    shared->columns = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)columns_free);
+    shared->refs = G_N_ELEMENTS(functions);
+    for (guint i = 0; i < G_N_ELEMENTS(functions); i++)
         sqlite3_create_function_v2(db, functions[i].name, functions[i].count, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
-                                   cache, functions[i].call, NULL, NULL, free_cache);
-    }
+                                   shared, functions[i].call, NULL, NULL, free_cache);
     sqlite3_create_collation(db, "BQL_TEXT", SQLITE_UTF8, NULL, collate_folded);
 }
