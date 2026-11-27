@@ -1,56 +1,73 @@
 # M365-BEC-MCP
 
-Investigate Microsoft 365 business email compromise from an MCP client. The local C17 server uses the desktop analyzer’s engine to search Entra, Purview and Exchange evidence. Each timeline result links back to a file and source location.
+An MCP server for the [M365 Email Log Analyzer](https://github.com/xss3cut10n3r/M365-BEC). Point Claude, or any MCP client, at your Purview audit, Entra sign-in, Entra directory audit, and Exchange message trace exports and let it search the timeline, mark what is malicious, and export the findings.
 
-## Connect a case
+It reads and writes the same `.bec` case files as the desktop app. Your original files are never changed.
 
-Download **[Windows x64](https://github.com/xss3cut10n3r/M365-BEC-MCP/releases/latest/download/M365-BEC-MCP-windows-x64.zip)** or **[Linux x64](https://github.com/xss3cut10n3r/M365-BEC-MCP/releases/latest/download/M365-BEC-MCP-linux-x64.tar.gz)** and extract it, or build the server using the [build instructions](docs/build.md). The Linux build targets Ubuntu 24.04 and needs `libglib2.0-0t64 libsqlite3-0 libexpat1 libzip4t64 libxlsxwriter5`. Add this entry to your MCP client's configuration, replacing both paths with absolute paths on your machine.
+**[Windows x64](https://github.com/xss3cut10n3r/M365-BEC-MCP/releases/latest/download/M365-BEC-MCP-windows-x64.zip)** | **[Linux x64](https://github.com/xss3cut10n3r/M365-BEC-MCP/releases/latest/download/M365-BEC-MCP-linux-x64.tar.gz)**
+
+## Usage
+
+1. Extract the download.
+2. Add the server to your MCP client with absolute paths, then restart the client.
+3. Ask a question, such as "Who signed in to this mailbox from outside the UK, and what did they send?"
+
+```sh
+claude mcp add m365-bec -- C:/tools/M365-BEC-MCP/bin/m365-bec-mcp.exe --case C:/cases/incident.bec --allow-marks
+```
 
 ```json
 {
   "mcpServers": {
     "m365-bec": {
-      "command": "C:/tools/m365-bec-mcp/bin/m365-bec-mcp.exe",
-      "args": ["--case", "C:/cases/incident.bec"]
+      "command": "C:/tools/M365-BEC-MCP/bin/m365-bec-mcp.exe",
+      "args": ["--case", "C:/cases/incident.bec", "--allow-marks"]
     }
   }
 }
 ```
 
-On Linux, use the installed `bin/m365-bec-mcp` path. Restart the client after changing its configuration. In Claude Code, run `claude mcp add m365-bec -- C:/tools/m365-bec-mcp/bin/m365-bec-mcp.exe --case C:/cases/incident.bec --allow-marks`.
+Replies contain evidence from the case and are visible to the MCP client and its model.
+
+## Options
 
 | Argument | Effect |
 | --- | --- |
-| `--case CASE.bec` | Open an analyzer case. It stays read-only unless another argument below says otherwise. |
-| `--input FILE` | Import a CSV, XLSX or JSON export. With `--case` the logs are saved in that case, which is created when missing. Alone, they share a temporary case for the session. Repeatable. |
-| `--allow-marks` | Enable `mark_events` so verdicts are saved in the case and show in the desktop analyzer. |
-| `--export-dir DIRECTORY` | Enable `export_events` into an existing directory. |
-| `--full-output` | Send unclipped values, raw records and MCP `structuredContent`. |
+| `--case CASE.bec` | Open a case. Read-only unless an option below is given. |
+| `--input FILE` | Import a CSV, Excel, or JSON export. With `--case` it is saved in that case; alone it uses a temporary one. Repeatable. |
+| `--allow-marks` | Let the client mark events good, bad, or unsure. |
+| `--export-dir DIRECTORY` | Let the client export into this folder. |
+| `--full-output` | Send unclipped values and MCP `structuredContent`. |
 
-Use one tenant per case. Imports never change the original files, and marks never change the evidence stored in a case. The server communicates over stdio. Its replies can contain sensitive evidence and are visible to the configured MCP client and its model.
-
-## Investigate
-
-Start with “What evidence do we have, which sources are missing, and which exports show warnings?” Then ask “What changed for this mailbox after containment? Show the UTC times and source records.”
+## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `case_overview` | Inventory files, hashes, observed dates, undated rows, import issues and source coverage. |
-| `search_events` | Filter the UTC timeline with BQL. `fields` adds columns such as `subject`, `location` or `/AuditData/Item/Attachments`. |
-| `inspect_event` | Read one source record as nested JSON, or one subtree or value with `field`. |
-| `case_statistics` | Count groups for several reports at once: sign-in outcomes, devices, mail flow, rules, grants and mailbox access. |
-| `compare_containment` | Compare a mailbox before and after a responder-supplied UTC timestamp. |
-| `mark_events` | Mark events Good, Bad or Unsure by filter, IP address, event key or time range. `undo` reverts the last mark. |
-| `export_events` | Save filtered rows as CSV, XLSX or JSON. XLSX rows are coloured by verdict. |
+| `case_overview` | Logs, hashes, date coverage, warnings, and missing sources. |
+| `search_events` | Filter the timeline, with extra columns on request. |
+| `inspect_event` | One original record, or one field of it. |
+| `case_statistics` | Counts by IP, account, device, location, operation, and more. |
+| `compare_containment` | A mailbox before and after a containment time. |
+| `mark_events` | Mark by filter, IP, event, or time range, with undo. |
+| `export_events` | Save events as CSV, Excel, or JSON. |
 
-For a timeline search, try `mailbox = "user@example.org" AND operation contains "InboxRule"`. The `search_events` description lists every filter field, and `raw contains "text"` searches whole records. To inspect a statistics group, search for its dimension, such as `ip = "203.0.113.7"`, joined with the report's `scope` when one is given. Follow `next_offset` for additional results. The event key stays tied to its source record within the case.
+Filters use the app's syntax:
 
-Five prompts guide collection planning, intake, investigation, containment verification and handoff. [Investigation guide](docs/investigation.md)
+```text
+mailbox = "analyst@example.org" AND operation contains "InboxRule"
+field "/status/errorCode" = "50126"
+```
 
-## Response size
+Five prompts cover collection, intake, investigation, containment, and handoff. See the [investigation guide](docs/investigation.md).
 
-Results are tables: one `columns` list and one array per row. A row's `log` and `row` give its source file, through `case_overview`, and its line. Whole-second times drop the fraction. Searches return 20 rows by default, statistics 15 groups per report, and up to 200 with `limit`. A page holds about 12 KiB, so follow `next_offset` when it appears. Cells longer than 192 characters are cut and the result says so.
+## Build
 
-`inspect_event` decodes embedded JSON such as `AuditData`, omits empty values and cuts strings at 400 characters. Pass `field` for an exact value, which pages by `offset` when long. A record too large for one reply lists its field paths instead.
+C17 with SQLite and CMake. See the [build instructions](docs/build.md).
 
-Containment counts are ordered `[before, after]`. To investigate a count, join the period’s BQL and the category’s BQL with `AND`, enclosing each in parentheses. The period filter alone reproduces the total.
+The Linux download targets Ubuntu 24.04 and needs these packages:
+
+```sh
+sudo apt install libglib2.0-0t64 libsqlite3-0 libexpat1 libzip4t64 libxlsxwriter5
+```
+
+[GPL-3.0](LICENSE)
